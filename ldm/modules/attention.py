@@ -1,5 +1,4 @@
 import math
-import sys
 from inspect import isfunction
 
 import torch
@@ -233,54 +232,41 @@ class CrossAttention(nn.Module):
         if speed_mp:
             return self.light_forward(x, context=context, mask=mask, dtype=dtype, fucking_hell=fucking_hell)
         h = self.heads
-        device = x.device
-        secondary_device = device if (self.fast_forward and sys.platform != "darwin") else torch.device("cpu")  # macs
-        dtype = x.dtype if dtype is None else dtype
-        x = x.to(dtype, non_blocking=True)
-        q_proj = self.to_q(x)
+        q = self.to_q(x)
         context = default(context, x)
-        k_proj = self.to_k(context)
-        v_proj = self.to_v(context)
+        k = self.to_k(context)
+        v = self.to_v(context)
 
         del context, x
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q_proj, k_proj, v_proj))
-        del q_proj, k_proj, v_proj
-        if sys.platform != "darwin" and device != "cpu":  # means we can't count gpu memory
-            torch.cuda.empty_cache()
-            stats = torch.cuda.memory_stats(device)
-            mem_active = stats['active_bytes.all.current']
-            mem_reserved = stats['reserved_bytes.all.current']
-            mem_free_cuda, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
-            mem_free_torch = mem_reserved - mem_active
-            mem_free_total = (mem_free_cuda + mem_free_torch)
-            mem_free_total = math.ceil(mem_free_total / 10 ** int(math.log10(mem_free_total) - 1)) * (
-                    10 ** int(math.log10(mem_free_total) - 1))
-            dtype_multiplyer = 2 if str(dtype) == "torch.float16" else 4
-            s1, s2, s3, s4 = (q.shape[0] * q.shape[1] * q.shape[1] * 1.5 * dtype_multiplyer), \
-                             (q.shape[0] * (q.shape[1] ** 2) * dtype_multiplyer), \
-                             (q.shape[0] * q.shape[1] * q.shape[2] * 3 * dtype_multiplyer), \
-                             (q.shape[0] * q.shape[1] * v.shape[2] * 2 * dtype_multiplyer)
-            s = int((s1 + s2 + s3 + s4))
-            # 4 main operations' needed compute memory: softmax, einsum, another einsum, and r1 allocation memory.
-            chunk_split = int(((s / mem_free_total) + 1)) * (2 if fucking_hell else 1) if s > mem_free_cuda else 1
-        else:
-            chunk_split = 1
-        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=secondary_device)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        torch.cuda.empty_cache()
+        stats = torch.cuda.memory_stats(torch.device(0))
+        mem_active = stats['active_bytes.all.current']
+        mem_reserved = stats['reserved_bytes.all.current']
+        mem_free_cuda, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
+        mem_free_torch = mem_reserved - mem_active
+        mem_free_total = (mem_free_cuda + mem_free_torch)
+        mem_free_total = math.ceil(mem_free_total / 10 ** int(math.log10(mem_free_total) - 1)) * (
+                10 ** int(math.log10(mem_free_total) - 1))
+        dtype_multiplyer = 2 if str(dtype) == "torch.float16" else 4
+        s1, s2, s3, s4 = (q.shape[0] * q.shape[1] * q.shape[1] * 1.5 * dtype_multiplyer), \
+                         (q.shape[0] * (q.shape[1] ** 2) * dtype_multiplyer), \
+                         (q.shape[0] * q.shape[1] * q.shape[2] * 3 * dtype_multiplyer), \
+                         (q.shape[0] * q.shape[1] * v.shape[2] * 2 * dtype_multiplyer)
+        s = int((s1 + s2 + s3 + s4))
+        # 4 main operations' needed compute memory: softmax, einsum, another einsum, and r1 allocation memory.
+        chunk_split = int(((s / mem_free_total) + 1)) * (2 if fucking_hell else 1) if s > mem_free_cuda else 1
+        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=torch.device(0))
         mp = q.shape[1] // chunk_split
         # print("The operation will need \t", s, s // 1024 // 1024)
         # print("The available memory is \t", mem_free_total, mem_free_total // 1024 // 1024)
         # print(f"Splitting into {chunk_split} chunks")
         for i in range(0, q.shape[1], mp):
-            q, k = q.to(device, non_blocking=True), k.to(device, non_blocking=True)
             s1 = einsum('b i d, b j d -> b i j', q[:, i:i + mp], k)
-            q, k = q.to(secondary_device, non_blocking=True), k.to(secondary_device, non_blocking=True)
             s1 *= self.scale
             s1 = F.softmax(s1, dim=-1)
-            t1 = einsum('b i j, b j d -> b i d', s1, v).to(secondary_device, non_blocking=True)
-            r1[:, i:i + mp] = t1
-            r1[:, i:i + mp].grad = t1.grad.clone()
-            del t1
-        r1 = rearrange(r1, '(b h) n d -> b n (h d)', h=h).to(device, non_blocking=True)
+            r1[:, i:i + mp] = einsum('b i j, b j d -> b i d', s1, v)
+        r1 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(r1)
 
 
